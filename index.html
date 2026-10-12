@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mozaic</title>
+<style>
+  :root {
+    --bg: #f6f6f4; --panel: #ffffff; --text: #1d1d1f; --muted: #6b6b70;
+    --line: #dcdcd8; --accent: #2f6fed; --accent-text: #fff; --ok: #1f9d55;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161618; --panel: #1f1f22; --text: #ececee; --muted: #9a9aa2;
+      --line: #34343a; --accent: #5b8cff; --accent-text: #fff; --ok: #3ccf7f;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Noto Sans JP", sans-serif;
+  }
+  main { max-width: 960px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 22px; margin: 0 0 16px; }
+  .drop {
+    border: 2px dashed var(--line); border-radius: 12px; background: var(--panel);
+    padding: 28px 16px; text-align: center; color: var(--muted); cursor: pointer;
+    transition: border-color .15s, background .15s;
+  }
+  .drop.over { border-color: var(--accent); }
+  .drop strong { color: var(--text); }
+  .controls {
+    display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: center;
+    margin: 16px 0; padding: 14px 16px; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 12px;
+  }
+  .controls label { display: flex; align-items: center; gap: 8px; }
+  input[type=range] { width: 200px; }
+  input[type=number] {
+    width: 76px; padding: 4px 6px; font: inherit; color: var(--text);
+    background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+  }
+  .spacer { flex: 1; }
+  button {
+    font: inherit; padding: 8px 16px; border-radius: 8px; cursor: pointer;
+    border: 1px solid var(--line); background: var(--bg); color: var(--text);
+  }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  .info { color: var(--muted); font-size: 13px; min-height: 1.5em; }
+  .info.ok { color: var(--ok); }
+  .stage {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 12px; display: flex; justify-content: center; overflow: auto;
+  }
+  canvas { max-width: 100%; height: auto; image-rendering: pixelated; display: block; }
+  .stage.empty { display: none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Mozaic — 画像モザイク</h1>
+
+  <div class="drop" id="drop" tabindex="0">
+    <strong>画像をドロップ</strong>、クリックして選択、または <strong>⌘V / Ctrl+V</strong> で貼り付け
+    <input type="file" id="file" accept="image/*" hidden>
+  </div>
+
+  <div class="controls">
+    <label>ブロックサイズ
+      <input type="range" id="range" min="1" max="100" value="16">
+      <input type="number" id="size" min="1" max="2000" value="16"> px
+    </label>
+    <span class="spacer"></span>
+    <button id="download" disabled>PNG保存</button>
+    <button id="copy" class="primary" disabled>クリップボードにコピー</button>
+  </div>
+  <div class="info" id="info"></div>
+
+  <div class="stage empty" id="stage"><canvas id="canvas"></canvas></div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const drop = $('drop'), fileInput = $('file'), range = $('range'), sizeInput = $('size');
+const copyBtn = $('copy'), dlBtn = $('download'), info = $('info');
+const stage = $('stage'), canvas = $('canvas'), ctx = canvas.getContext('2d');
+
+let srcData = null; // 元画像の ImageData
+
+function setInfo(msg, ok = false) {
+  info.textContent = msg;
+  info.classList.toggle('ok', ok);
+}
+
+function loadBlob(blob) {
+  if (!blob || !blob.type.startsWith('image/')) { setInfo('画像ファイルではありません'); return; }
+  const url = URL.createObjectURL(blob);
+  const img = new Image();
+  img.onload = () => {
+    const w = img.naturalWidth, h = img.naturalHeight;
+    const tmp = document.createElement('canvas');
+    tmp.width = w; tmp.height = h;
+    const tctx = tmp.getContext('2d');
+    tctx.drawImage(img, 0, 0);
+    srcData = tctx.getImageData(0, 0, w, h);
+    URL.revokeObjectURL(url);
+    canvas.width = w; canvas.height = h;
+    stage.classList.remove('empty');
+    copyBtn.disabled = dlBtn.disabled = false;
+    render();
+  };
+  img.onerror = () => { setInfo('画像を読み込めませんでした'); URL.revokeObjectURL(url); };
+  img.src = url;
+}
+
+// 各ブロックの平均色で塗りつぶす
+function render() {
+  if (!srcData) return;
+  const size = Math.max(1, parseInt(sizeInput.value, 10) || 1);
+  const { width: w, height: h, data: src } = srcData;
+  const out = new ImageData(w, h);
+  const dst = out.data;
+
+  for (let by = 0; by < h; by += size) {
+    const bh = Math.min(size, h - by);
+    for (let bx = 0; bx < w; bx += size) {
+      const bw = Math.min(size, w - bx);
+      let r = 0, g = 0, b = 0, a = 0;
+      for (let y = by; y < by + bh; y++) {
+        let i = (y * w + bx) * 4;
+        for (let x = 0; x < bw; x++, i += 4) {
+          const al = src[i + 3];
+          r += src[i] * al; g += src[i + 1] * al; b += src[i + 2] * al; a += al;
+        }
+      }
+      const n = bw * bh;
+      const R = a ? r / a : 0, G = a ? g / a : 0, B = a ? b / a : 0, A = a / n;
+      for (let y = by; y < by + bh; y++) {
+        let i = (y * w + bx) * 4;
+        for (let x = 0; x < bw; x++, i += 4) {
+          dst[i] = R; dst[i + 1] = G; dst[i + 2] = B; dst[i + 3] = A;
+        }
+      }
+    }
+  }
+  ctx.putImageData(out, 0, 0);
+  setInfo(`${w} × ${h}px / ブロック ${size}px`);
+}
+
+function canvasBlob() {
+  return new Promise(res => canvas.toBlob(res, 'image/png'));
+}
+
+// 入力
+drop.addEventListener('click', () => fileInput.click());
+drop.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') fileInput.click(); });
+fileInput.addEventListener('change', () => { loadBlob(fileInput.files[0]); fileInput.value = ''; });
+['dragenter', 'dragover'].forEach(t => drop.addEventListener(t, e => { e.preventDefault(); drop.classList.add('over'); }));
+['dragleave', 'drop'].forEach(t => drop.addEventListener(t, e => { e.preventDefault(); drop.classList.remove('over'); }));
+drop.addEventListener('drop', e => loadBlob(e.dataTransfer.files[0]));
+window.addEventListener('dragover', e => e.preventDefault());
+window.addEventListener('drop', e => { e.preventDefault(); if (e.dataTransfer.files[0]) loadBlob(e.dataTransfer.files[0]); });
+window.addEventListener('paste', e => {
+  const item = [...e.clipboardData.items].find(i => i.type.startsWith('image/'));
+  if (item) loadBlob(item.getAsFile());
+});
+
+// ブロックサイズ
+let raf = 0;
+function schedule() { cancelAnimationFrame(raf); raf = requestAnimationFrame(render); }
+range.addEventListener('input', () => { sizeInput.value = range.value; schedule(); });
+sizeInput.addEventListener('input', () => {
+  const v = parseInt(sizeInput.value, 10);
+  if (v >= 1) { range.value = Math.min(v, range.max); schedule(); }
+});
+
+// 出力
+// Clipboard API が使えない環境（非セキュアコンテキスト等）向け：img を選択して execCommand でコピー
+function legacyCopy() {
+  const holder = document.createElement('div');
+  holder.contentEditable = 'true';
+  holder.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0;';
+  const img = new Image();
+  img.src = canvas.toDataURL('image/png');
+  holder.appendChild(img);
+  document.body.appendChild(holder);
+  const sel = window.getSelection();
+  const range = document.createRange();
+  range.selectNode(img);
+  sel.removeAllRanges();
+  sel.addRange(range);
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch (_) {}
+  sel.removeAllRanges();
+  holder.remove();
+  return ok;
+}
+
+copyBtn.addEventListener('click', async () => {
+  if (navigator.clipboard && window.ClipboardItem) {
+    try {
+      // Safari はユーザー操作中に ClipboardItem を作る必要があるため Promise を渡す
+      await navigator.clipboard.write([new ClipboardItem({ 'image/png': canvasBlob() })]);
+      setInfo('クリップボードにコピーしました', true);
+      return;
+    } catch (err) {
+      if (legacyCopy()) { setInfo('クリップボードにコピーしました', true); return; }
+      setInfo('コピーに失敗しました: ' + err.message);
+      return;
+    }
+  }
+  if (legacyCopy()) {
+    setInfo('クリップボードにコピーしました（互換モード）', true);
+  } else {
+    setInfo('コピーできませんでした。画像を右クリック →「画像をコピー」を使うか、localhost / https で開いてください');
+  }
+});
+dlBtn.addEventListener('click', async () => {
+  const blob = await canvasBlob();
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'mosaic.png';
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+});
+</script>
+</body>
+</html>
